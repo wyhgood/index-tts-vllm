@@ -104,7 +104,7 @@ nohup python api_server_v2.py \
     --model_dir "./$MODEL_REL_PATH" \
     --host 0.0.0.0 \
     --port 6006 \
-    --gpu_memory_utilization 0.9 \
+    --gpu_memory_utilization 0.95 \
     > "$LOG_FILE" 2>&1 &
 
 sleep 5
