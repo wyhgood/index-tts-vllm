@@ -1,134 +1,109 @@
 #!/bin/bash
 
-# 遇到错误立即停止 (除了特定的检查命令)
+# 遇到错误立即停止
 set -e
 
-# --- 基础配置 ---
-PROJECT_NAME="index-tts-vllm"
+# --- 配置 ---
+# 这一行是用来判断当前目录是不是项目根目录的特征文件
+CHECK_FILE="api_server_v2.py"
+PROJECT_REPO="https://github.com/Ksuriuri/index-tts-vllm.git"
+PROJECT_DIR_NAME="index-tts-vllm"
 ENV_NAME="index-tts-vllm"
-MODEL_DIR="./checkpoints/IndexTTS-2-vLLM"
 LOG_FILE="api_server.log"
 
-# --- 权限检测 ---
-if [ "$EUID" -eq 0 ]; then
-  SUDO_CMD=""
+# --- 权限 ---
+if [ "$EUID" -eq 0 ]; then SUDO_CMD=""; else SUDO_CMD="sudo"; fi
+
+echo "============================================================"
+echo "   IndexTTS-2 智能感知启动脚本 (V8)"
+echo "============================================================"
+
+# 1. 智能判断当前位置 (解决重复Clone的核心逻辑)
+if [ -f "$CHECK_FILE" ]; then
+    echo "📍 [位置] 检测到脚本已在项目根目录下运行。"
+    # 既然在里面了，就不需要改路径
+    WORK_DIR="."
 else
-  SUDO_CMD="sudo"
+    echo "📍 [位置] 脚本在项目外部，正在检查项目文件夹..."
+    
+    # 如果当前目录下没有项目文件夹，才去 Clone
+    if [ ! -d "$PROJECT_DIR_NAME" ]; then
+        echo "⬇️ [代码] 未找到项目，正在克隆..."
+        git clone "$PROJECT_REPO"
+    fi
+    
+    # 进入目录
+    cd "$PROJECT_DIR_NAME"
+    WORK_DIR="."
+    echo "📂 [目录] 已进入 $PROJECT_DIR_NAME"
 fi
 
-echo "============================================================"
-echo "   IndexTTS-2 智能部署/重启脚本 (V5)"
-echo "============================================================"
+# 现在的当前目录一定是项目根目录了，执行更新
+echo "🔄 [代码] 尝试拉取最新代码 (git pull)..."
+git pull || true
 
-# 1. 基础环境检查 (快速掠过)
+# 2. 基础工具检查
 if ! command -v git &> /dev/null; then
-    echo "[系统] 检测到缺少 git，正在安装..."
+    echo "[系统] 安装 git..."
     $SUDO_CMD apt update && $SUDO_CMD apt install -y git curl wget build-essential
 fi
 
-# 2. Conda 加载
-echo "[Conda] 正在加载 Conda 环境..."
-# 尝试定位 Conda
+# 3. Conda 环境加载
 CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/miniconda")
 if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
     source "$CONDA_BASE/etc/profile.d/conda.sh"
 elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
     source "$HOME/anaconda3/etc/profile.d/conda.sh"
 else
-    # 如果实在找不到，尝试安装 (仅在真的没有conda命令时)
-    if ! command -v conda &> /dev/null; then
-        echo "[Conda] 未检测到 Conda，开始安装 Miniconda..."
-        wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-        bash miniconda.sh -b -p $HOME/miniconda
-        rm miniconda.sh
-        source $HOME/miniconda/bin/activate
-        conda init
-        
-        # 修复源 (仅在初次安装时执行)
-        echo "[Conda] 配置 conda-forge 源..."
-        cat > ~/.condarc <<EOF
-channels:
-  - conda-forge
-show_channel_urls: true
-default_channels:
-  - https://conda.anaconda.org/conda-forge
-channel_priority: strict
-EOF
-    fi
+    export PATH="$HOME/miniconda/bin:$PATH"
+    source activate 2>/dev/null || true
 fi
 
-# 3. 项目代码同步
-echo "[代码] 检查项目代码..."
-if [ -d "$PROJECT_NAME" ]; then
-    cd "$PROJECT_NAME"
-    echo "[代码] 项目已存在，执行 git pull 更新..."
-    git pull
-else
-    echo "[代码] 克隆项目..."
-    git clone https://github.com/Ksuriuri/index-tts-vllm.git
-    cd "$PROJECT_NAME"
+# 4. 激活环境
+echo "[环境] 激活 Conda 环境..."
+# 如果环境不存在，这里可能会报错，建议先手动保证环境建立，或者保持之前脚本的create逻辑
+if ! conda info --envs | grep -q "$ENV_NAME"; then
+     echo "⚠️ 环境不存在，正在创建..."
+     conda create -n "$ENV_NAME" python=3.12 --override-channels -c conda-forge -y
 fi
+conda activate "$ENV_NAME" || source activate "$ENV_NAME"
 
-# 4. 虚拟环境检查
-echo "[环境] 检查虚拟环境 '$ENV_NAME'..."
-if conda info --envs | grep -q "$ENV_NAME"; then
-    echo "[环境] 环境已存在，跳过创建，直接激活。"
-    conda activate "$ENV_NAME"
-else
-    echo "[环境] 环境不存在，正在创建 (Python 3.12)..."
-    # 使用 --override-channels 和 -c conda-forge 确保成功
-    conda create -n "$ENV_NAME" python=3.12 --override-channels -c conda-forge -y
-    conda activate "$ENV_NAME"
-fi
-
-# 5. 依赖安装 (pip 会自动跳过已安装的包，速度很快)
-echo "[依赖] 检查/安装依赖..."
+# 5. 依赖补全
 pip install -r requirements.txt 2>/dev/null | grep -v 'Requirement already satisfied' || true
 pip install modelscope 2>/dev/null | grep -v 'Requirement already satisfied' || true
 
-# 6. 模型检查
-echo "[模型] 检查模型权重..."
-if [ -d "$MODEL_DIR" ] && [ "$(ls -A $MODEL_DIR)" ]; then
-    echo "[模型] 检测到模型目录 '$MODEL_DIR' 且不为空，跳过下载。"
+# 6. 模型检测 (V7版逻辑保持)
+MODEL_REL_PATH="checkpoints/IndexTTS-2-vLLM"
+if [ -d "$MODEL_REL_PATH" ] && [ "$(ls -A $MODEL_REL_PATH)" ]; then
+    echo "✅ [模型] 检测到模型已存在，跳过下载。"
 else
-    echo "[模型] 模型缺失，开始下载 IndexTTS-2-vLLM..."
+    echo "⬇️ [模型] 开始下载模型..."
     mkdir -p checkpoints
-    python -c "from modelscope import snapshot_download; snapshot_download('kusuriuri/IndexTTS-2-vLLM', local_dir='$MODEL_DIR')"
+    python -c "from modelscope import snapshot_download; snapshot_download('kusuriuri/IndexTTS-2-vLLM', local_dir='$MODEL_REL_PATH')"
 fi
 
-# 7. 服务重启 (核心逻辑)
-echo "[服务] 准备重启 API 服务..."
+# 7. 启动服务
+echo "[服务] 重置服务..."
+pkill -f "api_server_v2.py" || true
+sleep 1
 
-# 查找并杀掉旧进程
-PID=$(pgrep -f "api_server_v2.py")
-if [ -n "$PID" ]; then
-    echo "[服务] 停止旧进程 (PID: $PID)..."
-    kill -9 $PID
-else
-    echo "[服务] 没有运行中的旧进程。"
-fi
-
-echo "[服务] 正在启动新进程..."
-# 后台启动
+echo "[服务] 启动中 (显存 0.9)..."
+# 注意：这里使用相对路径 checkpoints/...
 nohup python api_server_v2.py \
-    --model_dir "$MODEL_DIR" \
+    --model_dir "./$MODEL_REL_PATH" \
     --host 0.0.0.0 \
     --port 6006 \
-    --gpu_memory_utilization 0.25 \
+    --gpu_memory_utilization 0.9 \
     > "$LOG_FILE" 2>&1 &
 
-# 稍微等待一下，检查是否立即报错退出
 sleep 3
 if pgrep -f "api_server_v2.py" > /dev/null; then
     echo "============================================================"
-    echo "✅ 服务启动成功！"
-    echo "📍 地址: http://<你的IP>:6006"
-    echo "📝 日志: tail -f $PROJECT_NAME/$LOG_FILE"
+    echo "🚀 启动成功！"
+    echo "📂 工作目录: $(pwd)"
+    echo "📝 日志路径: $(pwd)/$LOG_FILE"
     echo "============================================================"
 else
-    echo "============================================================"
-    echo "❌ 服务启动失败！请检查日志："
-    echo "cat $PROJECT_NAME/$LOG_FILE"
-    echo "============================================================"
-    exit 1
+    echo "❌ 启动失败，请查看日志："
+    tail -n 10 "$LOG_FILE"
 fi
