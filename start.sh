@@ -4,51 +4,45 @@
 set -e
 
 # --- 配置 ---
-# 这一行是用来判断当前目录是不是项目根目录的特征文件
 CHECK_FILE="api_server_v2.py"
 PROJECT_REPO="https://github.com/Ksuriuri/index-tts-vllm.git"
 PROJECT_DIR_NAME="index-tts-vllm"
 ENV_NAME="index-tts-vllm"
 LOG_FILE="api_server.log"
+# 模型路径
+MODEL_REL_PATH="checkpoints/IndexTTS-2-vLLM"
 
 # --- 权限 ---
 if [ "$EUID" -eq 0 ]; then SUDO_CMD=""; else SUDO_CMD="sudo"; fi
 
 echo "============================================================"
-echo "   IndexTTS-2 智能感知启动脚本 (V8)"
+echo "   IndexTTS-2 暴力清理显存启动版 (V9)"
 echo "============================================================"
 
-# 1. 智能判断当前位置 (解决重复Clone的核心逻辑)
+# 1. 智能位置判断
 if [ -f "$CHECK_FILE" ]; then
-    echo "📍 [位置] 检测到脚本已在项目根目录下运行。"
-    # 既然在里面了，就不需要改路径
+    echo "📍 [位置] 当前已在项目目录。"
     WORK_DIR="."
 else
-    echo "📍 [位置] 脚本在项目外部，正在检查项目文件夹..."
-    
-    # 如果当前目录下没有项目文件夹，才去 Clone
+    echo "📍 [位置] 脚本在外部，检查项目..."
     if [ ! -d "$PROJECT_DIR_NAME" ]; then
-        echo "⬇️ [代码] 未找到项目，正在克隆..."
+        echo "⬇️ [代码] 克隆项目..."
         git clone "$PROJECT_REPO"
     fi
-    
-    # 进入目录
     cd "$PROJECT_DIR_NAME"
     WORK_DIR="."
-    echo "📂 [目录] 已进入 $PROJECT_DIR_NAME"
 fi
 
-# 现在的当前目录一定是项目根目录了，执行更新
-echo "🔄 [代码] 尝试拉取最新代码 (git pull)..."
+# 2. 代码更新
+echo "🔄 [代码] 检查更新..."
 git pull || true
 
-# 2. 基础工具检查
+# 3. 基础环境
 if ! command -v git &> /dev/null; then
-    echo "[系统] 安装 git..."
     $SUDO_CMD apt update && $SUDO_CMD apt install -y git curl wget build-essential
 fi
 
-# 3. Conda 环境加载
+# 4. Conda 环境
 CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/miniconda")
 if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
     source "$CONDA_BASE/etc/profile.d/conda.sh"
@@ -59,36 +53,53 @@ else
     source activate 2>/dev/null || true
 fi
 
-# 4. 激活环境
-echo "[环境] 激活 Conda 环境..."
-# 如果环境不存在，这里可能会报错，建议先手动保证环境建立，或者保持之前脚本的create逻辑
+# 激活环境
 if ! conda info --envs | grep -q "$ENV_NAME"; then
-     echo "⚠️ 环境不存在，正在创建..."
      conda create -n "$ENV_NAME" python=3.12 --override-channels -c conda-forge -y
 fi
 conda activate "$ENV_NAME" || source activate "$ENV_NAME"
 
-# 5. 依赖补全
+# 5. 依赖与模型
 pip install -r requirements.txt 2>/dev/null | grep -v 'Requirement already satisfied' || true
 pip install modelscope 2>/dev/null | grep -v 'Requirement already satisfied' || true
 
-# 6. 模型检测 (V7版逻辑保持)
-MODEL_REL_PATH="checkpoints/IndexTTS-2-vLLM"
 if [ -d "$MODEL_REL_PATH" ] && [ "$(ls -A $MODEL_REL_PATH)" ]; then
-    echo "✅ [模型] 检测到模型已存在，跳过下载。"
+    echo "✅ [模型] 已存在，跳过下载。"
 else
-    echo "⬇️ [模型] 开始下载模型..."
+    echo "⬇️ [模型] 下载中..."
     mkdir -p checkpoints
     python -c "from modelscope import snapshot_download; snapshot_download('kusuriuri/IndexTTS-2-vLLM', local_dir='$MODEL_REL_PATH')"
 fi
 
-# 7. 启动服务
-echo "[服务] 重置服务..."
-pkill -f "api_server_v2.py" || true
-sleep 1
+# ========================================================
+# 7. 暴力清理显存与重启逻辑 (核心修改)
+# ========================================================
+echo "🧹 [服务] 正在清理旧进程与显存..."
 
-echo "[服务] 启动中 (显存 0.9)..."
-# 注意：这里使用相对路径 checkpoints/...
+# 1. 发送强制终止信号 (kill -9)
+# 同时查找 api_server_v2.py 和可能残留的 vllm 进程
+PIDS=$(pgrep -f "api_server_v2.py" || true)
+
+if [ -n "$PIDS" ]; then
+    echo "   检测到进程 ID: $PIDS，正在强制击杀..."
+    echo "$PIDS" | xargs kill -9 2>/dev/null || true
+else
+    echo "   没有发现运行中的进程。"
+fi
+
+# 2. 死循环等待，直到进程彻底消失
+echo "   正在确认进程完全退出..."
+while pgrep -f "api_server_v2.py" > /dev/null; do
+    echo "   ...等待进程释放资源..."
+    sleep 1
+done
+
+# 3. 显存冷却时间 (关键)
+# 进程虽然没了，但 NVIDIA 驱动回收显存需要几秒钟
+echo "❄️  [显存] 等待 NVIDIA 驱动回收显存 (3秒)..."
+sleep 3
+
+echo "🚀 [服务] 正在启动 (显存利用率 0.9)..."
 nohup python api_server_v2.py \
     --model_dir "./$MODEL_REL_PATH" \
     --host 0.0.0.0 \
@@ -96,14 +107,11 @@ nohup python api_server_v2.py \
     --gpu_memory_utilization 0.9 \
     > "$LOG_FILE" 2>&1 &
 
-sleep 3
+sleep 5
 if pgrep -f "api_server_v2.py" > /dev/null; then
-    echo "============================================================"
-    echo "🚀 启动成功！"
-    echo "📂 工作目录: $(pwd)"
-    echo "📝 日志路径: $(pwd)/$LOG_FILE"
-    echo "============================================================"
+    echo "✅ 启动成功！"
+    echo "📝 日志: $(pwd)/$LOG_FILE"
 else
-    echo "❌ 启动失败，请查看日志："
+    echo "❌ 启动失败，最后10行日志："
     tail -n 10 "$LOG_FILE"
 fi
